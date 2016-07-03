@@ -1,0 +1,8 @@
+name = Commerce Avangard
+description = Provides integration with the Avangard API
+package = Commerce - Payment
+dependencies[] = commerce
+dependencies[] = commerce_payment
+core = 7.x
+
+; $Id$

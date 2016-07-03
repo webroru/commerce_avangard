@@ -1,0 +1,323 @@
+<?php
+
+/**
+ * @file
+ * Provides a Avangard API (via XML) payment method for Drupal Commerce (width redirection).
+ */
+
+
+// Avangard Server URLs for Registration, Information and Transaction.
+define('AVANGARD_SERVER_REG', 'https://www.avangard.ru/iacq/h2h/reg');
+define('AVANGARD_SERVER_PAY', 'https://www.avangard.ru/iacq/pay');
+define('AVANGARD_SERVER_INFO', 'https://www.avangard.ru/iacq/h2h/get_order_info');
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_avangard_menu() {
+  $items['commerce/avangard/response'] = array(
+    'page callback' => 'commerce_avangard_response',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['commerce/avangard/test'] = array(
+    'page callback' => 'commerce_avangard_cron',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_avangard_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['commerce_avangard'] = array(
+    'title' => t('Avangard API'),
+    'short_title' => t('Avangard API'),
+    'display_title' => t('Bank Card (VISA / MasterCard / MaestroCard)'),
+    'description' => t('Integration with Avangard API.'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'active' => TRUE,
+  );
+  return $payment_methods;
+}
+
+/**
+ * Settings form for Avangard API payment method.
+ *
+ * Used to set merchant id and  password within Rules settings.
+ */
+function commerce_avangard_settings_form($settings = NULL) {
+  $form = array();
+
+  // Merge default settings into the stored settings array.
+  $settings = (array) $settings + array(
+    'merchant_id' => '',
+    'hash_password' => '',
+  );
+
+  $form['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#description' => t('This is the merchant ID that Avangard sent you when you set up your account.'),
+    '#default_value' => $settings['merchant_id'],
+    '#required' => TRUE,
+  );
+
+  $form['hash_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Password'),
+    '#description' => t('This is the hash password that Avangard sent you.'),
+    '#default_value' => $settings['hash_password'],
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_avangard_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+
+  $form = array();
+  $text = theme('image', array(
+    'path' => drupal_get_path('module', 'commerce_avangard') . '/cards.png',
+    'alt' => t('VISA / MasterCard / MaestroCard'),
+    'title' => t('VISA / MasterCard / MaestroCard'),
+    'attributes' => array('class' => 'cards'))
+  );
+  $text .= '<div class="acquiring-desc">' . t('Pay via VISA / MasterCard / MaestroCard') . '</div>';
+  $form['avangard_information'] = array('#markup' => $text);
+
+  $form['dummy'] = array(
+    '#type' => 'hidden',
+    '#value' => 'dummy'
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_avangard_submit_form_submit($payment_method, $pane_form, $pane_values, &$order, $charge) {
+  // Create request to send to Avangard.
+
+  if (!isset($payment_method['settings']['merchant_id']) && !isset($payment_method['settings']['hash_password'])) {
+    watchdog('commerce_avangard', '%method : Merchant id and hash password have not been set in the payment settings. Cannot proceed with transaction', WATCHDOG_ERROR);
+    drupal_set_message(t('The Avangard gateway has not been correctly configured - see watchdog for details. Cannot proceed with payment'), 'error');
+    return FALSE;
+  }
+    return TRUE;
+}
+
+/**
+ * Payment method callback: payment redirect form.
+ */
+function commerce_avangard_redirect_form($form, &$form_state, $order, $payment_method) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  commerce_avangard_curl('reg', $order);
+  $ticket = $order->data['commerce_avangard']['ticket'];
+  $form['#action'] = AVANGARD_SERVER_PAY;
+
+  $form['ticket'] = array(
+    '#type' => 'hidden',
+    '#value' => $ticket,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay via Bank Card'),
+  );
+  return $form;
+}
+
+/**
+ * Menu callback.
+ */
+function commerce_avangard_response() {
+  $order_id   = isset($_GET['order_id'])    ? $_GET['order_id']     : '';
+  $result_code  = isset($_GET['result_code'])   ? $_GET['result_code']  : '';
+
+  $order = commerce_order_load($order_id);
+
+  // Error handling
+  if (!$order) {
+    return t('The order does not exist.');
+    }
+  if (!$result_code) {
+    return t('The result code does not exist.');
+  }
+
+  if ($result_code == $order->data['commerce_avangard']['failure_code']) {
+    $back_url = url($GLOBALS['base_url'] . '/checkout/' . $order->order_id . '/payment/back/');
+    drupal_set_message(t('Payment canceled'), 'error');
+    drupal_goto($back_url);
+  }
+  commerce_avangard_transaction($order, '1');
+  commerce_payment_redirect_pane_next_page($order);
+  if ($result_code == $order->data['commerce_avangard']['ok_code']) {
+    drupal_set_message(t('Payment success'), 'status');
+  }
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Requesting information on CRON
+ */
+function commerce_avangard_cron() {
+  $orders = commerce_order_load_multiple(array(), array('status' => 'pending'));
+  $orders = array_merge($orders, commerce_order_load_multiple(array(), array('status' => 'checkout_payment')));
+
+  foreach ($orders as $order) {
+        if ($order->order_id == 716) {
+            var_dump($order->data);
+        }
+        if (isset($order->data['commerce_avangard']['ticket']) AND !isset($order->data['commerce_avangard']['status_code'])) {
+      commerce_avangard_curl('info', $order);
+      $status_code = $order->data['commerce_avangard']['status_code'];
+      commerce_avangard_transaction($order, $status_code);
+      if ($status_code == 3) {
+        commerce_checkout_complete($order);
+                commerce_avangard_commerce_payment_order_paid_in_full($order);
+      }
+    }
+  }
+}
+
+/**
+ * Create a CURL reqest
+ */
+function commerce_avangard_curl($post_type, $order) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+
+  if (isset($order->data['commerce_avangard']['ticket'])) {
+    $ticket = $order->data['commerce_avangard']['ticket'];
+  }
+
+  $shop_id = $payment_method['settings']['merchant_id'];
+  $shop_passwd = $payment_method['settings']['hash_password'];
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $order_number = $order->order_id;
+  $order_description = 'site payment';
+  $language = 'RU';
+  $back_url = url($GLOBALS['base_url'] . '/commerce/avangard/response?order_id=' . $order->order_id);
+  $client_email = $order->mail;
+
+  switch ($post_type) {
+    case 'info':
+      $post = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Get_order_info><Ticket>$ticket</Ticket><Shop_id>$shop_id</Shop_id><Shop_passwd>$shop_passwd</Shop_passwd></Get_order_info>";
+      $server_url = AVANGARD_SERVER_INFO;
+      $raw_response = commerce_avangard_curl_session($server_url, $post);
+      preg_match('%<Response_code>.*</Response_code>%i', $raw_response, $response_code);
+      preg_match('%<Response_message>.*</Response_message>%i', $raw_response, $response_message);
+      preg_match('%<Status_code>.*</Status_code>%i', $raw_response, $status_code);
+      $response_code = drupal_substr($response_code[0], 15, -16);
+      $response_message = drupal_substr($response_message[0], 18, -19);
+      $status_code = drupal_substr($status_code[0], 13, -14);
+      $order->data['commerce_avangard']['status_code'] = $status_code;
+      commerce_order_save($order);
+      break;
+    case 'reg':
+      $post = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><New_order><Shop_id>$shop_id</Shop_id><Shop_passwd>$shop_passwd</Shop_passwd><Amount>$amount</Amount><Order_number>$order_number</Order_number><Order_description>$order_description</Order_description><Language>$language</Language><Back_url>$back_url</Back_url><Client_email>$client_email</Client_email></New_order>";
+      $server_url = AVANGARD_SERVER_REG;
+      $raw_response = commerce_avangard_curl_session($server_url, $post);
+      preg_match('%<Response_code>.*</Response_code>%i', $raw_response, $response_code);
+      preg_match('%<Response_message>.*</Response_message>%i', $raw_response, $response_message);
+      preg_match('%<Ticket>.*</Ticket>%i', $raw_response, $ticket);
+      preg_match('%<Ok_code>.*</Ok_code>%i', $raw_response, $ok_code);
+      preg_match('%<Failure_code>.*</Failure_code>%i', $raw_response, $failure_code);
+      $response_code = drupal_substr($response_code[0], 15, -16);
+      $response_message = drupal_substr($response_message[0], 18, -19);
+      $ticket = drupal_substr($ticket[0], 8, -9);
+      $ok_code = drupal_substr($ok_code[0], 9, -10);
+      $failure_code = drupal_substr($failure_code[0], 14, -15);
+      $order->data['commerce_avangard']['ticket'] = $ticket;
+      $order->data['commerce_avangard']['response_code'] = $response_code;
+      $order->data['commerce_avangard']['ok_code'] = $ok_code;
+      $order->data['commerce_avangard']['failure_code'] = $failure_code;
+      commerce_order_save($order);
+
+      break;
+  }
+
+  if ($response_code) {
+    watchdog('commerce_avangard', '%payment_method Payment failed: %message', array('%message' => $response_message), WATCHDOG_WARNING);
+  }
+
+  watchdog('commerce_avangard', "%payment_method auth data: server url: %server_url<br />postdata: %post<br />response: %raw_response<br />response code: %response_code<br />
+response message: %response_message", array('%server_url' => $server_url, '%post' => htmlentities($post), '%raw_response' => htmlentities($raw_response), '%response_code' => $response_code, '%response_message' => $response_message), WATCHDOG_INFO);
+
+}
+
+/**
+ * Send request to Avangard server.
+ */
+function commerce_avangard_curl_session($server_url, $post){
+  $headers = array('Content-type: application/x-www-form-urlencoded;charset="utf-8"');
+  set_time_limit(60);
+  $curl_session = curl_init();
+  curl_setopt($curl_session, CURLOPT_URL, $server_url);
+  curl_setopt($curl_session, CURLOPT_HTTPHEADER, $headers);
+  curl_setopt($curl_session, CURLOPT_POST, 1);
+  curl_setopt($curl_session, CURLOPT_POSTFIELDS, "xml=".$post);
+  curl_setopt($curl_session, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($curl_session, CURLOPT_TIMEOUT, 30);
+  curl_setopt($curl_session, CURLOPT_SSL_VERIFYPEER, FALSE);
+  curl_setopt($curl_session, CURLOPT_SSL_VERIFYHOST, 1);
+  $raw_response = curl_exec($curl_session);
+  curl_close($curl_session);
+  return $raw_response;
+}
+
+/**
+ * Create a transaction and associate it with an order.
+ */
+
+function commerce_avangard_transaction($order, $status_code) {
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // If this is authorization for which we've already
+  // created a transaction...
+  $transactions = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
+  if (!empty($transactions)) {
+    // Load transaction and update that with the capture values.
+    $transaction = reset($transactions);
+  }
+  else {
+    // Create a new payment transaction for the order.
+    $transaction = commerce_payment_transaction_new('commerce_avangard', $order->order_id);
+    $transaction->instance_id = $order->data['payment_method'];
+  }
+  $transaction->amount = $order_wrapper->commerce_order_total->amount->value();
+  $transaction->currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+
+  // Set a status for the payment - one of COMMERCE_PAYMENT_STATUS_SUCCESS, COMMERCE_PAYMENT_STATUS_PENDING or COMMERCE_PAYMENT_STATUS_FAILURE.
+  switch ($status_code) {
+    case '1':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      $transaction->message = t('The payment has pending.');
+//      commerce_order_status_update($order, 'checkout_payment');
+      break;
+    case '3':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has pending.');
+      commerce_order_status_update($order, 'checkout_complete');
+      break;
+    case '2':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('The payment has canceled.');
+//      commerce_order_status_update($order, 'canceled');
+      break;
+  }
+  commerce_payment_transaction_save($transaction);
+}
